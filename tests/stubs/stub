@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Test stub for system commands. Logs every call to $BO_TEST_LOG and keeps a
+# tiny fake package/unit database under $BO_ROOT/var/lib/stub.
+set -euo pipefail
+
+cmd=$(basename "$0")
+printf '%s %s\n' "$cmd" "$*" >> "${BO_TEST_LOG:?}"
+
+db="${BO_ROOT:?}/var/lib/stub"
+pkgs="$db/pkgs"
+units="$db/units"
+mkdir -p "$db"
+touch "$pkgs" "$units"
+
+pkg_add() { grep -q "^$1 " "$pkgs" || printf '%s %s\n' "$1" "${2:-1.0}" >> "$pkgs"; sort -o "$pkgs" "$pkgs"; }
+pkg_del() { sed -i "/^$1 /d" "$pkgs"; }
+unit_get() { awk -v u="$1" '$1 == u { print $2 }' "$units" | tail -1; }
+unit_set() { sed -i "/^$1 /d" "$units"; printf '%s %s\n' "$1" "$2" >> "$units"; sort -o "$units" "$units"; }
+unit_del() { sed -i "/^$1 /d" "$units"; }
+
+# units shipped by packages
+pkg_units() {
+  case "$1" in
+    tlp) echo tlp.service ;;
+    tlp-pd) echo tlp-pd.service ;;
+    power-profiles-daemon) echo power-profiles-daemon.service ;;
+    tuned-ppd) echo tuned-ppd.service ;;
+  esac
+}
+
+case "$cmd" in
+  dpkg-query)
+    # dpkg-query -W -f=FORMAT PKG
+    pkg="${!#}"
+    fmt="${2:-}"
+    line=$(grep "^$pkg " "$pkgs" || true)
+    [[ -n "$line" ]] || exit 1
+    case "$fmt" in
+      *Status*) printf installed ;;
+      *Version*) printf '%s' "${line#* }" ;;
+    esac
+    ;;
+  apt-get)
+    [[ "$1" == install ]] || exit 0
+    shift
+    skip=0
+    for a in "$@"; do
+      if (( skip )); then skip=0; continue; fi
+      case "$a" in
+        -o) skip=1; continue ;;
+        -*) continue ;;
+        *-)
+          p="${a%-}"; pkg_del "$p"
+          for u in $(pkg_units "$p"); do unit_del "$u"; done ;;
+        *)
+          case "$a" in tlp|tlp-pd|tlp-rdw) v=1.9.1-1~noble ;; *) v=1.0 ;; esac
+          pkg_add "$a" "$v"
+          for u in $(pkg_units "$a"); do [[ -n "$(unit_get "$u")" ]] || unit_set "$u" enabled; done ;;
+      esac
+    done
+    ;;
+  add-apt-repository)
+    f="$BO_ROOT/etc/apt/sources.list.d/linrunner-ubuntu-tlp-noble.sources"
+    if [[ " $* " == *" --remove "* ]]; then rm -f "$f"
+    else mkdir -p "$(dirname "$f")"; echo "URIs: https://ppa.launchpadcontent.net/linrunner/tlp/ubuntu/" > "$f"; fi
+    ;;
+  systemctl)
+    args=()
+    for a in "$@"; do [[ "$a" == --* ]] || args+=("$a"); done
+    verb="${args[0]:-}"; unit="${args[1]:-}"
+    case "$verb" in
+      is-enabled) s=$(unit_get "$unit"); [[ -n "$s" ]] || exit 1; echo "$s"; [[ "$s" == enabled ]] ;;
+      is-active) echo inactive; exit 3 ;;
+      enable)  [[ -n "$(unit_get "$unit")" || "$unit" == battery-optimizer-hook.service ]] && unit_set "$unit" enabled; exit 0 ;;
+      disable) [[ -n "$(unit_get "$unit")" ]] && unit_set "$unit" disabled; exit 0 ;;
+      daemon-reload)
+        # units whose file was deleted disappear (only our hook lives in /etc)
+        [[ -f "$BO_ROOT/etc/systemd/system/battery-optimizer-hook.service" ]] || unit_del battery-optimizer-hook.service ;;
+      mask)    unit_set "$unit" masked ;;
+      unmask)  [[ "$(unit_get "$unit")" == masked ]] && unit_set "$unit" disabled; exit 0 ;;
+      *) exit 0 ;;
+    esac
+    ;;
+  prime-select)
+    f="$db/prime"; [[ -f "$f" ]] || echo on-demand > "$f"
+    if [[ "${1:-}" == query ]]; then cat "$f"; else echo "$1" > "$f"; fi
+    ;;
+  modinfo) exit 0 ;;
+  tlpctl) [[ "${1:-}" == get ]] && echo balanced ;;
+  lspci|gdbus) exit 1 ;;
+  *) exit 0 ;;
+esac

@@ -1,0 +1,38 @@
+# Installed by battery-optimizer 1.2.0 — removed by: battery-optimizer uninstall
+[Unit]
+Description=Battery Optimizer profile hook (Power Saver brightness, Docker, iGPU cap)
+Documentation=https://linrunner.de/tlp
+After=dbus.service tlp-pd.service
+Wants=tlp-pd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I /usr/local/lib/battery-optimizer/hook/profile-hook --config /etc/battery-optimizer/hook.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+# Hardening: /sys stays writable (backlight, iGPU frequency); everything else
+# is read-only except the state directory.
+StateDirectory=battery-optimizer
+StateDirectoryMode=0700
+UMask=0077
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+NoNewPrivileges=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

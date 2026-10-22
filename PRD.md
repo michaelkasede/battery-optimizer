@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Owner** | Michael Kasede |
-| **Status** | Approved direction, ready for implementation |
+| **Status** | Implemented on `feature/tlp-pd`; measurement gate (§4, §9) pending on the reference machine |
 | **Target release** | v1.2.0 |
 | **Reference hardware** | Lenovo ThinkPad P14s Gen 3 (21AL) — i7-1280P, Iris Xe, NVIDIA T550 (no display outputs), 52.5 Wh |
 | **Supported platform** | Ubuntu 24.04.5 LTS (GNOME 46, Wayland or X11) on laptops with an integrated GPU + a discrete GPU |
@@ -112,15 +112,20 @@ All three profiles are expressed as TLP parameters in a single drop-in, `/etc/tl
 | `CPU_BOOST` / `CPU_HWP_DYN_BOOST` | 1 / 1 | 1 / 0 | 0 / 0 |
 | `CPU_MAX_PERF` | 100 | 60–80 | 35 |
 | Intel GPU max/boost freq | default | default | capped (detect min/max from sysfs) |
-| `PCIE_ASPM` | default | default | powersupersave |
-| `WIFI_PWR` | off | on | on |
-| `RUNTIME_PM` | on | auto | auto |
+| `PCIE_ASPM` | default | powersupersave ¹ | powersupersave ¹ |
+| `WIFI_PWR` | off | on ¹ | on ¹ |
+| `RUNTIME_PM` | on ² | auto ¹ | auto ¹ |
+| Intel iGPU max/boost freq (hook) | default | default | 30 % of RPn→RP0 range ³ |
 | Brightness cap (hook) | off | off | 40 % |
 | Docker (hook) | ignore | ignore | stop while active, restore on exit |
 
-Exact values are tuning decisions to validate with measurements; keep them in one place (`config/profiles.conf` in the repo) rendered into the drop-in.
+¹ **TLP 1.9 has `_ON_SAV` variants only for `CPU_*`, `PLATFORM_PROFILE` and `AMDGPU_ABM_LEVEL`** (verified in the 1.9.1 source: `tlp.conf.in`, `func.d/*` map power-saver to the `_ON_BAT` value for every other parameter). Balanced and Power Saver therefore always share ASPM, Wi-Fi, runtime PM, SATA, audio and Intel GPU frequency settings. `PCIE_ASPM_ON_BAT=powersupersave` is a *policy* that only uses link states the firmware allows. It is not `pcie_aspm=force`.
+² dGPU drivers (`nvidia`, `amdgpu`, `nouveau`, `radeon`) are added to `RUNTIME_PM_DRIVER_DENYLIST`, so `RUNTIME_PM_ON_AC=on` can't keep the dGPU awake on AC. The GPU driver decides alone.
+³ Power-Saver-only extras that TLP can't express are applied by the hook (§5.2). The iGPU cap is i915-only. On `xe` it is skipped.
 
-Default: `TLP_AUTO_SWITCH=1` (Performance on AC, Balanced on battery, Power Saver when chosen). Make it a documented installer option.
+Exact values are tuning decisions to validate with measurements. They live in one place (`config/profiles.conf`) and are rendered into the drop-in.
+
+Default: `TLP_AUTO_SWITCH=1` (Performance on AC, Balanced on battery, Power Saver when chosen), set with `install --auto-switch`. TLP's own semantics: `0` = never switch (`TLP_DEFAULT_MODE`), `1` = always switch on plug/unplug and boot, `2` = *smart* (TLP's default). Smart mode keeps a Power Saver/Balanced choice on AC, and a Power Saver/Performance choice on battery, across plug events.
 
 ### 5.2 Profile hook (brightness cap, Docker)
 
@@ -135,13 +140,13 @@ TLP has no documented hook for profile changes, so v1.2 adds a small root servic
 
 | Component | Requirement |
 |---|---|
-| **TLP** | Install TLP ≥ 1.9 with `tlp-pd` and `tlp-rdw` from `ppa:linrunner/tlp`; remove/mask `power-profiles-daemon` |
+| **TLP** | Install TLP ≥ 1.9 with `tlp-pd` and `tlp-rdw` from `ppa:linrunner/tlp`; remove `power-profiles-daemon` and `tuned-ppd` (the Debian `tlp-pd` package `Conflicts:` with both); disable + mask `tuned` if present (it was enabled on the reference machine) |
 | **Charge thresholds** | `START_CHARGE_THRESH_BAT0` / `STOP_CHARGE_THRESH_BAT0` (default 40/80) in the TLP drop-in; skip with a notice where unsupported |
-| **NVIDIA dGPU** | Proprietary driver; `NVreg_DynamicPowerManagement=0x02` (Turing and newer); `prime-select on-demand` permanently; nouveau blacklisted; enable `nvidia-suspend/resume/hibernate` services when `PreserveVideoMemoryAllocations=1`; temp file path on disk (`/var/tmp`), not tmpfs |
+| **NVIDIA dGPU** | Proprietary driver (verified, not auto-installed: `ubuntu-drivers install` may need Secure Boot MOK enrollment); `NVreg_DynamicPowerManagement=0x02` (Turing and newer, detected as PCI device ID ≥ 0x1e00); `prime-select on-demand` permanently; nouveau blacklisted; enable `nvidia-suspend/resume/hibernate` services when `PreserveVideoMemoryAllocations=1`; temp file path on disk (`/var/tmp`), not tmpfs |
 | **AMD dGPU** | No driver options needed (runtime PM is default); verify `power/control=auto`; document `DRI_PRIME=1` |
 | **No GPU-mode switching** | Remove `prime-select intel/nvidia` from profiles — on-demand already powers the dGPU off when idle, and switching needs a logout/reboot |
 | **Gaming** | Not a menu mode. Document Steam launch options: NVIDIA `tlpctl launch -p performance prime-run %command%`; AMD `tlpctl launch -p performance env DRI_PRIME=1 %command%` |
-| **Kernel parameters** | Only via `/etc/default/grub.d/50-battery-optimizer.cfg` appending to `$GRUB_CMDLINE_LINUX_DEFAULT`. Default set: `nmi_watchdog=0`. `mem_sleep_default=deep` only if `/sys/power/mem_sleep` lists `deep`. Never edit `/etc/default/grub` directly |
+| **Kernel parameters** | **None.** TLP already sets `NMI_WATCHDOG=0` by default and `MEM_SLEEP_ON_AC/BAT` at runtime (rendered as `deep` only if `/sys/power/mem_sleep` lists it), so no `/etc/default/grub.d/` file is needed. `/etc/default/grub` is only edited by the v1.x migration, with a backup |
 | **thermald** | Enable on Intel CPUs only |
 | **Driver options** | None for i915/xe or iwlwifi by default |
 
@@ -154,7 +159,7 @@ Detect at install and on `--status`; never hard-code:
 - Battery name(s) (`BAT0`, `BAT1`) and charge-threshold support.
 - Backlight device for the internal panel.
 - Platform profile support (`/sys/firmware/acpi/platform_profile_choices`).
-- USB HID receivers (Logitech Unifying/Bolt and similar) → `USB_DENYLIST`.
+- USB HID receivers (Logitech Unifying/Bolt and similar) → `USB_DENYLIST`. Note: TLP already skips autosuspend for any USB device with a HID interface (`_hid_deny` in `func.d/20-tlp-func-usb`). The v1.1 receiver lag was most likely caused by `usbcore.autosuspend=5` / `powertop --auto-tune`, which bypass TLP. The explicit denylist is kept as a safeguard.
 - Suspend modes available.
 - Unsupported configurations (not Ubuntu 24.04.x, no dGPU, no battery) → refuse with a clear message unless `--force`.
 
@@ -253,11 +258,28 @@ Used for the §4 gate and to substantiate the runtime claim.
 | **v1.3.0** | Hardening (§6) complete; bats + CI; detection for AMD dGPU and NVIDIA-with-outputs laptops; `measure` command |
 | **v2.0 "Powerplay"** | Other distros and package managers; non-Ubuntu desktops |
 
-## 11. Open questions
+## 11. Decisions on the former open questions
 
-1. `TLP_AUTO_SWITCH` default: `1` (Performance on AC) or `2` (always keep the user's choice)?
-2. Exact Balanced CPU cap — keep v1.1's 35 % on battery (aggressive) or relax to 60–80 % now that Power Saver exists?
-3. Should Power Saver stop Docker automatically, or only warn?
-4. Verify the README's BIOS checklist (Graphics Mode, "Linux S3" sleep state, PSR toggle) against the P14s Gen 3 BIOS before keeping it in docs.
-5. Keep or drop `mem_sleep_default=deep` — only meaningful if the BIOS exposes S3.
-6. Leave the VFIO/IOMMU boot parameters to the user, or offer an opt-in cleanup?
+| # | Question | Decision |
+|---|---|---|
+| 1 | `TLP_AUTO_SWITCH` default | `1`: predictable (Performance on AC, Balanced on battery). `--auto-switch 2` gives TLP's smart mode |
+| 2 | Balanced CPU cap | `CPU_MAX_PERF_ON_BAT=80` with turbo on. The aggressive 35 % cap moved to Power Saver |
+| 3 | Docker in Power Saver | Stop automatically (`HOOK_DOCKER=stop`), restart on leaving. Only if `docker.service` was running; `warn` and `ignore` are available |
+| 4 | README BIOS checklist | Dropped from docs until verified on the P14s Gen 3 BIOS. No step depends on it |
+| 5 | `mem_sleep_default=deep` | Not a kernel parameter any more. TLP `MEM_SLEEP_*=deep` only where the firmware lists `deep` |
+| 6 | VFIO/IOMMU parameters | Left to the user. `status` warns (allow_unsafe_interrupts, pcie_acs_override, kvm.ignore_msrs, iommu=pt, intel_iommu=on). No opt-in cleanup in v1.2 |
+
+## 12. Implementation notes and refinements (v1.2.0)
+
+Findings while implementing that change or sharpen the requirements above:
+
+1. **Power Saver fallback (§5.1 ¹).** Only CPU/platform-profile settings differ between Balanced and Power Saver in TLP 1.9. Everything else Power Saver does differently comes from the hook (brightness, iGPU cap, Docker).
+2. **No boot parameters needed (§5.3).** TLP covers the NMI watchdog and suspend mode at runtime. A clean v1.2 install leaves `/proc/cmdline` stock, apart from the user's own VFIO parameters.
+3. **Dead v1.1 settings on current kernels.** `vm.laptop_mode` and TLP `DISK_IDLE_SECS_*` have no effect on kernel ≥ 7.0 (laptop_mode was removed; the reference machine runs 7.0). They are not carried over.
+4. **Profile-change signal.** TLP calls back into `tlp-pd` after it applies a profile, including automatic switches on plug/unplug, so `PropertiesChanged(ActiveProfile)` covers both manual and automatic changes. The udev rule only triggers a debounced resync (`systemctl try-reload-or-restart` → SIGHUP), which keeps the hook correct if `tlp-pd` restarts or misses an event.
+5. **Hook state is "restore once, only if untouched".** A value the user changed while in Power Saver (e.g. brightness) is not overwritten when they leave it. State lives in `/var/lib/battery-optimizer/state.json` (`StateDirectory=`), so it survives reboots.
+6. **Hook hardening.** `ProtectSystem=strict` (with `/sys` writable), `ProtectHome`, `PrivateTmp`, `PrivateNetwork`, `NoNewPrivileges`, `RestrictAddressFamilies=AF_UNIX`, `UMask=0077` and kernel/cgroup/clock protections. Docker is controlled through the systemd D-Bus API, never a shell.
+7. **Detection details.** The iGPU is the GPU with an eDP/LVDS/DSI connector, falling back to `boot_vga` and then to Intel. This handles AMD APUs that are not on PCI bus 0. HID batteries (`scope=Device`) are ignored. A missing platform-profile choice is mapped to the closest one (`low-power` → `quiet` / `cool`). With no platform profile at all, `PLATFORM_PROFILE_*` is omitted and TLP falls back to EPP.
+8. **Reference machine observations (2026-10-22).** v1.1 leftovers are still active (forced FBC/PSR, `pcie_aspm=force` and the rest of §3.1 in `/proc/cmdline`). `power-profiles-daemon` and `tuned` are both enabled while TLP is not installed. The T550 showed `runtime_status=active` on battery at ~18 W. `status` now reports the dGPU wake state and `nvidia-persistenced`, so this can be checked again after migration and a reboot.
+9. **Versioning (§7).** Tags `v1.0.0` (commit 73ebd71, the original root-level script) and `v1.1.0` (v1.1 + interim fixes) exist. The version folders were removed on `feature/tlp-pd`.
+10. **Verification done without root.** shellcheck clean. 57 bats tests cover the parser, detection on three fixture laptops, golden renders, migration, the install/idempotence/uninstall round-trip, and the hook logic. The hook was also tested live over D-Bus against the reference machine's `org.freedesktop.UPower.PowerProfiles` API (the one `tlp-pd` implements), including a real profile switch. `systemd-analyze verify` and `udevadm verify` pass for the generated unit and rules. **Still to do on hardware:** the §8 manual matrix and the §9 measurements.

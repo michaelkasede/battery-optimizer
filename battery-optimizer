@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+# battery-optimizer — TLP 1.9 + tlp-pd power profiles for Ubuntu 24.04 dGPU laptops.
+# Profiles are switched from GNOME Quick Settings (Power Mode) or `tlpctl`;
+# this CLI installs, inspects, measures and uninstalls.
+set -euo pipefail
+
+BO_HOME="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+BO_VERSION="$(<"$BO_HOME/VERSION")"
+
+# shellcheck source=lib/common.sh
+source "$BO_HOME/lib/common.sh"
+# shellcheck source=lib/config.sh
+source "$BO_HOME/lib/config.sh"
+# shellcheck source=lib/detect.sh
+source "$BO_HOME/lib/detect.sh"
+# shellcheck source=lib/render.sh
+source "$BO_HOME/lib/render.sh"
+# shellcheck source=lib/manifest.sh
+source "$BO_HOME/lib/manifest.sh"
+# shellcheck source=lib/migrate.sh
+source "$BO_HOME/lib/migrate.sh"
+# shellcheck source=lib/system.sh
+source "$BO_HOME/lib/system.sh"
+
+usage() {
+  cat <<EOF
+battery-optimizer $BO_VERSION
+
+Usage:
+  battery-optimizer install [--auto-switch 0|1|2] [--charge START:STOP]
+                            [--dry-run] [--yes] [--force] [--no-migrate]
+  battery-optimizer status
+  battery-optimizer measure [MINUTES] [--interval SECONDS]
+  battery-optimizer uninstall [--dry-run] [--yes] [--keep-ppa]
+  battery-optimizer --version
+
+install options:
+  --auto-switch N   TLP_AUTO_SWITCH: 0 never switch, 1 Performance on AC /
+                    Balanced on battery (default), 2 keep a manually chosen
+                    profile across plug/unplug
+  --charge S:E      battery charge thresholds in percent (default 40:80)
+  --dry-run         print every action, change nothing
+  --yes             do not ask (removes v1.x leftovers without prompting)
+  --force           install on an unsupported platform
+  --no-migrate      leave v1.x leftovers alone
+
+Switch profiles in GNOME Quick Settings → Power Mode, or with tlpctl:
+  tlpctl performance | tlpctl balanced | tlpctl power-saver
+EOF
+}
+
+# Refuse to run code or read config that unprivileged users could modify.
+check_tree_perms() {
+  local f bad=0 perms
+  while IFS= read -r -d '' f; do
+    perms=$(stat -c '%a' "$f")
+    if (( 8#$perms & 8#002 )); then
+      err "world-writable: $f"
+      bad=1
+    fi
+  done < <(find "$BO_HOME/battery-optimizer" "$BO_HOME/VERSION" "$BO_HOME/lib" \
+                "$BO_HOME/config" "$BO_HOME/templates" "$BO_HOME/hook" -print0 2>/dev/null)
+  (( bad == 0 )) || die "fix the permissions above (chmod o-w) before running as root"
+}
+
+print_detection() {
+  local bat flags rx i
+  info "OS:            ${OS_PRETTY:-unknown}"
+  info "CPU:           ${CPU_VENDOR:-unknown}"
+  info "iGPU:          ${IGPU_PCI:-none} ${IGPU_VENDOR:+($IGPU_VENDOR, driver ${IGPU_DRIVER:-none})} ${IGPU_NAME}"
+  if [[ -n "$DGPU_PCI" ]]; then
+    info "dGPU:          $DGPU_PCI ($DGPU_VENDOR, driver ${DGPU_DRIVER:-none}) ${DGPU_NAME}"
+    if dgpu_has_outputs; then
+      info "               VGA controller — may drive external outputs (dGPU wakes when they are used)"
+    else
+      info "               3D controller — no display outputs; can stay off at idle"
+    fi
+  else
+    info "dGPU:          none"
+  fi
+  for bat in "${BATTERIES[@]}"; do
+    flags=""
+    (( BAT_START[$bat] )) && flags+="start "
+    (( BAT_STOP[$bat] )) && flags+="stop"
+    info "Battery:       $bat (charge thresholds: ${flags:-unsupported})"
+  done
+  (( ${#BATTERIES[@]} )) || info "Battery:       none"
+  info "AC adapter:    $( (( AC_PRESENT )) && echo present || echo 'not found')"
+  info "Backlight:     ${BACKLIGHT:-none}"
+  info "Platform prof: ${PP_CHOICES:-unsupported}"
+  info "Suspend modes: ${MEM_SLEEP_MODES:-unknown}"
+  rx=""
+  for i in "${!USB_RECEIVERS[@]}"; do rx+="${USB_RECEIVERS[$i]} (${USB_RECEIVER_NAMES[$i]}) "; done
+  info "USB receivers: ${rx:-none}"
+}
+
+# ---------------------------------------------------------------- install
+
+# Runs only if install aborts after migration already changed boot files.
+install_exit_trap() {
+  local rc=$?
+  if (( rc != 0 && ! DRY_RUN && MIGRATE_BOOT_CHANGED )); then
+    err "install aborted after boot-time files were changed."
+    err "Rebuild them before rebooting: sudo update-initramfs -u && sudo update-grub"
+  fi
+}
+
+cmd_install() {
+  local charge="" force=0 no_migrate=0
+  while (( $# )); do
+    case "$1" in
+      --auto-switch) AUTO_SWITCH="${2:-}"; shift 2 ;;
+      --auto-switch=*) AUTO_SWITCH="${1#*=}"; shift ;;
+      --charge) charge="${2:-}"; shift 2 ;;
+      --charge=*) charge="${1#*=}"; shift ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      --yes|-y) ASSUME_YES=1; shift ;;
+      --force) force=1; shift ;;
+      --no-migrate) no_migrate=1; shift ;;
+      *) die "unknown install option: $1 (see --help)" ;;
+    esac
+  done
+  [[ "$AUTO_SWITCH" =~ ^[012]$ ]] || die "--auto-switch must be 0, 1 or 2"
+
+  require_root install
+  check_tree_perms
+  conf_parse "$BO_HOME/config/profiles.conf" || die "invalid config/profiles.conf"
+  if [[ -n "$charge" ]]; then
+    [[ "$charge" =~ ^([0-9]{1,3}):([0-9]{1,3})$ ]] || die "--charge must be START:STOP, e.g. 40:80"
+    local start=$((10#${BASH_REMATCH[1]})) stop=$((10#${BASH_REMATCH[2]}))
+    (( start < stop && stop <= 100 )) || die "--charge: START must be below STOP, STOP at most 100"
+    conf_set CHARGE_START "$start"
+    conf_set CHARGE_STOP "$stop"
+  fi
+
+  printf '%sbattery-optimizer %s — install%s%s\n' "$C_BLD" "$BO_VERSION" \
+    "$( (( DRY_RUN )) && printf ' (dry run — nothing will be changed)')" "$C_OFF"
+
+  section "Hardware"
+  detect_all
+  print_detection
+  if ! platform_supported; then
+    (( force )) || die "unsupported platform — re-run with --force to install anyway"
+    warn "continuing on an unsupported platform (--force)"
+  fi
+
+  manifest_load
+  BOOT_CHANGED=0
+  trap install_exit_trap EXIT
+
+  section "v1.x leftovers"
+  migrate_detect
+  if (( no_migrate )); then
+    info "skipped (--no-migrate)"
+  elif migrate_needed; then
+    migrate_print
+    if (( DRY_RUN )) || confirm "Remove these leftovers (backed up first)?"; then
+      migrate_apply
+      (( MIGRATE_BOOT_CHANGED )) && BOOT_CHANGED=1
+    else
+      warn "leftovers kept — they can override or conflict with v1.2 settings"
+      (( MIGRATE_TLP_CONF )) && warn "/etc/tlp.conf from v1.x overrides /etc/tlp.d/ drop-ins!"
+    fi
+  else
+    ok "none found"
+  fi
+
+  section "Packages"
+  step_packages
+
+  section "Graphics"
+  step_gpu
+
+  section "Configuration files"
+  step_files
+
+  section "Services"
+  step_services
+
+  section "Boot files"
+  step_rebuild_boot
+  trap - EXIT
+
+  section "Done"
+  if (( DRY_RUN )); then
+    info "Dry run complete — re-run without --dry-run to apply."
+    return 0
+  fi
+  ok "Installed. Manifest: $MANIFEST"
+  info "Switch profiles: GNOME Quick Settings → Power Mode, or 'tlpctl power-saver'"
+  info "Check:           battery-optimizer status"
+  (( BOOT_CHANGED )) && printf '\n  %sReboot required%s for driver/boot changes: sudo reboot\n' "$C_BLD" "$C_OFF"
+  return 0
+}
+
+# ---------------------------------------------------------------- uninstall
+
+cmd_uninstall() {
+  local keep_ppa=0
+  while (( $# )); do
+    case "$1" in
+      --dry-run) DRY_RUN=1; shift ;;
+      --yes|-y) ASSUME_YES=1; shift ;;
+      --keep-ppa) keep_ppa=1; shift ;;
+      *) die "unknown uninstall option: $1 (see --help)" ;;
+    esac
+  done
+  require_root uninstall
+
+  manifest_load
+  if (( ${#MANIFEST_LINES[@]} == 0 )); then
+    info "No manifest at $MANIFEST — nothing to uninstall."
+    return 0
+  fi
+  printf '%sbattery-optimizer %s — uninstall%s%s\n' "$C_BLD" "$BO_VERSION" \
+    "$( (( DRY_RUN )) && printf ' (dry run — nothing will be changed)')" "$C_OFF"
+  if (( ! DRY_RUN )) && ! confirm "Remove battery-optimizer and restore stock Ubuntu power management?"; then
+    die "aborted"
+  fi
+  BOOT_CHANGED=0
+  uninstall_all "$keep_ppa"
+
+  section "Done"
+  if (( DRY_RUN )); then
+    info "Dry run complete — re-run without --dry-run to apply."
+  else
+    ok "Uninstalled. Backups (if any) remain in $STATE_DIR/backup-*"
+    (( BOOT_CHANGED )) && printf '\n  %sReboot required%s: sudo reboot\n' "$C_BLD" "$C_OFF"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------- status
+
+cmd_status() {
+  local f sum state cmdline profile w
+  printf '%sbattery-optimizer %s — status%s\n' "$C_BLD" "$BO_VERSION" "$C_OFF"
+
+  section "Hardware"
+  detect_all
+  print_detection
+  platform_supported 2>/dev/null || warn "platform outside the supported scope (Ubuntu 24.04 + dGPU + battery)"
+
+  section "Power profile"
+  profile=$(active_profile)
+  info "Active profile: ${profile:-unknown}"
+  info "TLP:            $(pkg_version tlp || echo 'not installed')"
+  info "Auto switch:    $(tlp_setting TLP_AUTO_SWITCH || echo 'unknown')"
+  for u in tlp.service tlp-pd.service "$HOOK_UNIT_NAME" power-profiles-daemon.service tuned.service thermald.service; do
+    info "$(printf '%-34s %s / %s' "$u" "$(unit_enabled_state "$u")" "$(unit_active_state "$u")")"
+  done
+  if apt_has_ppa; then info "APT source:     ppa:$TLP_PPA"; fi
+
+  section "Graphics"
+  if [[ -n "$DGPU_PCI" ]]; then
+    info "dGPU runtime PM: control=$(read_sys "$SYS/bus/pci/devices/$DGPU_PCI/power/control") status=$(read_sys "$SYS/bus/pci/devices/$DGPU_PCI/power/runtime_status")"
+    if [[ "$DGPU_VENDOR" == nvidia ]]; then
+      have prime-select && info "prime-select:    $(prime-select query 2>/dev/null || echo unknown)"
+      info "persistenced:    $(unit_enabled_state nvidia-persistenced.service) / $(unit_active_state nvidia-persistenced.service)"
+      if [[ "$(read_sys "$SYS/bus/pci/devices/$DGPU_PCI/power/runtime_status")" == active ]]; then
+        info "dGPU is awake. See what holds it: nvidia-smi; sudo fuser -v /dev/nvidia*"
+      fi
+    fi
+  fi
+
+  section "Battery"
+  local d start stop
+  for f in "${BATTERIES[@]}"; do
+    d="$SYS/class/power_supply/$f"
+    w=$(battery_watts "$d")
+    start=$(read_sys "$d/charge_control_start_threshold")
+    stop=$(read_sys "$d/charge_control_end_threshold")
+    info "$f: $(read_sys "$d/capacity")%, $(read_sys "$d/status")${w:+, $w W}${stop:+, charge thresholds ${start:-?}-$stop %}"
+  done
+
+  section "Installed files"
+  manifest_load
+  if (( ${#MANIFEST_LINES[@]} == 0 )); then
+    info "not installed (no $MANIFEST)"
+  else
+    while IFS= read -r f; do
+      [[ -n "$f" ]] || continue
+      if [[ ! -f "$(p "$f")" ]]; then
+        state="${C_RED}missing${C_OFF}"
+      else
+        sum=$(sha256_of "$(p "$f")")
+        if [[ "$sum" == "$(manifest_get file "$f")" ]]; then state="ok"; else state="${C_YLW}modified${C_OFF}"; fi
+      fi
+      info "$(printf '%-58s %s' "$f" "$state")"
+    done < <(manifest_keys file)
+  fi
+
+  section "Warnings"
+  local warned=0 key
+  migrate_detect
+  if migrate_needed; then
+    warn "v1.x leftovers present (run install to remove):"; migrate_print; warned=1
+  fi
+  cmdline=$(read_sys "$PROC/cmdline")
+  local legacy=""
+  for key in "${LEGACY_GRUB_KEYS[@]}"; do
+    if [[ " $cmdline " == *" $key="* || " $cmdline " == *" $key "* ]]; then legacy+=" $key"; fi
+  done
+  if [[ -n "$legacy" ]]; then
+    warn "running kernel uses legacy parameters:$legacy"
+    info "  (install removes them from GRUB; they disappear after the next reboot)"
+    warned=1
+  fi
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    warn "boot parameter $f"; warned=1
+  done < <(weak_boot_param_warnings "$cmdline")
+  if unit_exists power-profiles-daemon.service && [[ "$(unit_enabled_state power-profiles-daemon.service)" != masked ]] \
+     && pkg_installed tlp-pd; then
+    warn "power-profiles-daemon is present next to tlp-pd"; warned=1
+  fi
+  if [[ "$(unit_active_state tuned.service)" == active ]]; then
+    warn "tuned is running and also changes power settings"; warned=1
+  fi
+  (( warned )) || ok "none"
+  return 0
+}
+
+# ---------------------------------------------------------------- measure
+
+cmd_measure() {
+  local minutes=10 interval=10
+  while (( $# )); do
+    case "$1" in
+      --interval) interval="${2:-}"; shift 2 ;;
+      [0-9]*) minutes="$1"; shift ;;
+      *) die "usage: battery-optimizer measure [MINUTES] [--interval SECONDS]" ;;
+    esac
+  done
+  [[ "$minutes" =~ ^[1-9][0-9]?$|^1[0-1][0-9]$|^120$ ]] || die "MINUTES must be 1-120"
+  [[ "$interval" =~ ^[1-9][0-9]?$ ]] || die "--interval must be 1-99 seconds"
+
+  detect_power_supplies
+  (( ${#BATTERIES[@]} )) || die "no battery found"
+  measure_draw "$minutes" "$interval"
+}
+
+main() {
+  local cmd="${1:-}"
+  [[ $# -gt 0 ]] && shift
+  case "$cmd" in
+    install)   cmd_install "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    status)    cmd_status "$@" ;;
+    measure)   cmd_measure "$@" ;;
+    --version|-V|version) printf 'battery-optimizer %s\n' "$BO_VERSION" ;;
+    -h|--help|help|"") usage ;;
+    *) err "unknown command: $cmd"; usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"

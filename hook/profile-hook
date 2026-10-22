@@ -1,0 +1,392 @@
+#!/usr/bin/python3 -I
+"""battery-optimizer profile hook.
+
+Applies the Power Saver extras that TLP has no setting for, and undoes them
+when another profile is selected:
+
+  * caps the internal panel's brightness       (HOOK_BRIGHTNESS_CAP_PCT)
+  * stops Docker, restarting it afterwards     (HOOK_DOCKER=stop|warn|ignore)
+  * caps the Intel iGPU (i915) max frequency   (HOOK_IGPU_MAX_PCT)
+
+Triggers (no polling):
+  * PropertiesChanged(ActiveProfile) from tlp-pd on the system bus
+  * SIGHUP — sent via `systemctl reload` by a udev rule on AC plug/unplug
+
+All actions are idempotent; what was changed is kept in
+$STATE_DIRECTORY/state.json so it can be restored exactly once, also after a
+reboot. A value is only restored if it still equals what the hook set (a
+manual change by the user wins).
+"""
+
+import argparse
+import json
+import logging
+import os
+import re
+import signal
+import sys
+
+BUS_NAME = "org.freedesktop.UPower.PowerProfiles"
+OBJECT_PATH = "/org/freedesktop/UPower/PowerProfiles"
+TLP_LAST_PWR = "/run/tlp/last_pwr"
+TLP_PROFILES = {"0": "performance", "1": "balanced", "2": "power-saver"}
+POWER_SAVER = "power-saver"
+DOCKER_UNITS = ("docker.socket", "docker.service")
+RESYNC_DELAY_S = 2
+
+CONF_ALLOW = {
+    "HOOK_BRIGHTNESS_CAP_PCT": re.compile(r"^([0-9]|[1-9][0-9]|100)$"),
+    "HOOK_DOCKER": re.compile(r"^(stop|warn|ignore)$"),
+    "HOOK_IGPU_MAX_PCT": re.compile(r"^([0-9]|[1-9][0-9]|100)$"),
+    "HOOK_BACKLIGHT": re.compile(r"^([A-Za-z0-9_:-][A-Za-z0-9_.:-]*)?$"),
+    "HOOK_IGPU_PCI": re.compile(r"^([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7])?$"),
+}
+CONF_DEFAULTS = {
+    "HOOK_BRIGHTNESS_CAP_PCT": "0",
+    "HOOK_DOCKER": "ignore",
+    "HOOK_IGPU_MAX_PCT": "100",
+    "HOOK_BACKLIGHT": "",
+    "HOOK_IGPU_PCI": "",
+}
+
+log = logging.getLogger("battery-optimizer-hook")
+
+
+class ConfigError(Exception):
+    pass
+
+
+def parse_config(path):
+    """KEY=VALUE against an allow-list; the file is never executed."""
+    st = os.stat(path)
+    if st.st_mode & 0o002:
+        raise ConfigError(f"{path} is world-writable")
+    conf = dict(CONF_DEFAULTS)
+    with open(path, encoding="utf-8") as f:
+        for lineno, raw in enumerate(f, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, sep, value = line.partition("=")
+            if not sep or key not in CONF_ALLOW:
+                raise ConfigError(f"{path}:{lineno}: key not allowed: {key}")
+            if len(value) >= 2 and value[0] == value[-1] == '"':
+                value = value[1:-1]
+            if not CONF_ALLOW[key].match(value):
+                raise ConfigError(f"{path}:{lineno}: invalid value for {key}: {value!r}")
+            conf[key] = value
+    return conf
+
+
+def read_int(path):
+    with open(path, encoding="ascii") as f:
+        return int(f.read().strip())
+
+
+def write_int(path, value):
+    with open(path, "w", encoding="ascii") as f:
+        f.write(f"{int(value)}\n")
+
+
+class State:
+    """Persistent record of what the hook changed."""
+
+    def __init__(self, state_dir):
+        self.path = os.path.join(state_dir, "state.json")
+        self.data = {}
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self.data = data
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as e:
+            log.warning("ignoring unreadable state file %s: %s", self.path, e)
+
+    def get(self, key):
+        return self.data.get(key)
+
+    def set(self, key, value):
+        self.data[key] = value
+        self._save()
+
+    def drop(self, key):
+        if self.data.pop(key, None) is not None:
+            self._save()
+
+    def _save(self):
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.data, f)
+        os.replace(tmp, self.path)
+
+
+class Brightness:
+    def __init__(self, conf, state, sysfs):
+        self.pct = int(conf["HOOK_BRIGHTNESS_CAP_PCT"])
+        self.state = state
+        name = conf["HOOK_BACKLIGHT"]
+        self.dev = os.path.join(sysfs, "class/backlight", name) if name else None
+
+    def enter(self):
+        if not self.dev or self.pct <= 0 or self.state.get("brightness"):
+            return
+        try:
+            cur = read_int(os.path.join(self.dev, "brightness"))
+            cap = max(1, read_int(os.path.join(self.dev, "max_brightness")) * self.pct // 100)
+            if cur > cap:
+                write_int(os.path.join(self.dev, "brightness"), cap)
+                self.state.set("brightness", {"dev": self.dev, "saved": cur, "set": cap})
+                log.info("brightness capped %d -> %d (%d%%)", cur, cap, self.pct)
+        except (OSError, ValueError) as e:
+            log.warning("brightness cap failed: %s", e)
+
+    def leave(self):
+        rec = self.state.get("brightness")
+        if not rec:
+            return
+        try:
+            path = os.path.join(rec["dev"], "brightness")
+            if read_int(path) == rec["set"]:
+                write_int(path, rec["saved"])
+                log.info("brightness restored to %d", rec["saved"])
+            else:
+                log.info("brightness changed by user; not restoring")
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            log.warning("brightness restore failed: %s", e)
+        self.state.drop("brightness")
+
+
+class IntelGpuFreq:
+    """Caps i915 gt_max_freq_mhz / gt_boost_freq_mhz between RPn and RP0."""
+
+    def __init__(self, conf, state, sysfs):
+        self.pct = int(conf["HOOK_IGPU_MAX_PCT"])
+        self.state = state
+        self.card = None
+        pci = conf["HOOK_IGPU_PCI"]
+        if pci:
+            drm = os.path.join(sysfs, "bus/pci/devices", pci, "drm")
+            try:
+                for entry in sorted(os.listdir(drm)):
+                    if re.match(r"^card[0-9]+$", entry) and os.path.exists(
+                        os.path.join(drm, entry, "gt_max_freq_mhz")
+                    ):
+                        self.card = os.path.join(drm, entry)
+                        break
+            except OSError:
+                pass
+
+    def _f(self, name):
+        return os.path.join(self.card, name)
+
+    def enter(self):
+        if not self.card or self.pct >= 100 or self.state.get("igpu"):
+            return
+        try:
+            rp0 = read_int(self._f("gt_RP0_freq_mhz"))
+            rpn = read_int(self._f("gt_RPn_freq_mhz"))
+            cap = rpn + (rp0 - rpn) * self.pct // 100
+            cur_max = read_int(self._f("gt_max_freq_mhz"))
+            cur_boost = read_int(self._f("gt_boost_freq_mhz"))
+            if cur_max <= cap and cur_boost <= cap:
+                return
+            write_int(self._f("gt_max_freq_mhz"), cap)
+            write_int(self._f("gt_boost_freq_mhz"), cap)
+            self.state.set("igpu", {"card": self.card, "max": cur_max, "boost": cur_boost, "set": cap})
+            log.info("iGPU max/boost capped to %d MHz (was %d/%d)", cap, cur_max, cur_boost)
+        except (OSError, ValueError) as e:
+            log.warning("iGPU cap failed: %s", e)
+
+    def leave(self):
+        rec = self.state.get("igpu")
+        if not rec:
+            return
+        try:
+            card = rec["card"]
+            if read_int(os.path.join(card, "gt_max_freq_mhz")) == rec["set"]:
+                write_int(os.path.join(card, "gt_max_freq_mhz"), rec["max"])
+            if read_int(os.path.join(card, "gt_boost_freq_mhz")) == rec["set"]:
+                write_int(os.path.join(card, "gt_boost_freq_mhz"), rec["boost"])
+            log.info("iGPU max/boost restored to %d/%d MHz", rec["max"], rec["boost"])
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            log.warning("iGPU restore failed: %s", e)
+        self.state.drop("igpu")
+
+
+class Docker:
+    def __init__(self, conf, state, systemd):
+        self.mode = conf["HOOK_DOCKER"]
+        self.state = state
+        self.systemd = systemd  # callable(method, args) or None
+
+    def _active_units(self):
+        if not self.systemd:
+            return []
+        units = self.systemd("ListUnitsByNames", list(DOCKER_UNITS))
+        return [u[0] for u in units if u[3] in ("active", "activating", "reloading")]
+
+    def enter(self):
+        if self.mode == "ignore" or self.state.get("docker"):
+            return
+        try:
+            active = self._active_units()
+            if "docker.service" not in active:
+                return
+            if self.mode == "warn":
+                log.warning("Docker is running in Power Saver (adds 2-5 W idle draw)")
+                return
+            for unit in ("docker.service", "docker.socket"):
+                if unit in active:
+                    self.systemd("StopUnit", unit)
+            self.state.set("docker", {"units": active})
+            log.info("stopped %s for Power Saver", ", ".join(active))
+        except Exception as e:  # D-Bus errors
+            log.warning("docker stop failed: %s", e)
+
+    def leave(self):
+        rec = self.state.get("docker")
+        if not rec or not self.systemd:
+            return
+        try:
+            for unit in ("docker.socket", "docker.service"):
+                if unit in rec.get("units", []):
+                    self.systemd("StartUnit", unit)
+            log.info("restarted %s", ", ".join(rec.get("units", [])))
+        except Exception as e:
+            log.warning("docker restart failed: %s", e)
+        self.state.drop("docker")
+
+
+class Hook:
+    def __init__(self, conf, state_dir, sysfs, systemd):
+        self.state = State(state_dir)
+        self.actions = [
+            Brightness(conf, self.state, sysfs),
+            IntelGpuFreq(conf, self.state, sysfs),
+            Docker(conf, self.state, systemd),
+        ]
+
+    def apply(self, profile):
+        log.info("active profile: %s", profile)
+        for action in self.actions:
+            if profile == POWER_SAVER:
+                action.enter()
+            else:
+                action.leave()
+
+    def restore(self):
+        for action in self.actions:
+            action.leave()
+
+
+def tlp_last_profile():
+    try:
+        with open(TLP_LAST_PWR, encoding="ascii") as f:
+            words = f.read().split()
+        return TLP_PROFILES.get(words[0]) if words else None
+    except OSError:
+        return None
+
+
+def make_systemd_caller(Gio, GLib, bus):
+    def call(method, arg):
+        if method == "ListUnitsByNames":
+            params = GLib.Variant("(as)", (arg,))
+        else:
+            params = GLib.Variant("(ss)", (arg, "replace"))
+        result = bus.call_sync(
+            "org.freedesktop.systemd1", "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager", method, params,
+            None, Gio.DBusCallFlags.NONE, 30000, None,
+        )
+        return result.unpack()[0]
+    return call
+
+
+def run_daemon(conf, args):
+    from gi.repository import Gio, GLib
+
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    hook = Hook(conf, args.state_dir, args.sysfs, make_systemd_caller(Gio, GLib, bus))
+    proxy = Gio.DBusProxy.new_sync(
+        bus, Gio.DBusProxyFlags.NONE, None, BUS_NAME, OBJECT_PATH, BUS_NAME, None
+    )
+    loop = GLib.MainLoop()
+    pending = {"id": 0}
+
+    def current_profile():
+        value = proxy.get_cached_property("ActiveProfile")
+        if value is not None:
+            return value.unpack()
+        return tlp_last_profile()
+
+    def sync(*_):
+        pending["id"] = 0
+        profile = current_profile()
+        if profile:
+            hook.apply(profile)
+        else:
+            log.info("no active profile reported yet (tlp-pd/TLP not running?)")
+        return GLib.SOURCE_REMOVE
+
+    def schedule_sync(*_):
+        # debounce: TLP may still be applying the new profile
+        if pending["id"]:
+            GLib.source_remove(pending["id"])
+        pending["id"] = GLib.timeout_add_seconds(RESYNC_DELAY_S, sync)
+        return GLib.SOURCE_CONTINUE
+
+    def on_props(_proxy, changed, _invalidated):
+        if "ActiveProfile" in changed.keys():
+            sync()
+
+    proxy.connect("g-properties-changed", on_props)
+    proxy.connect("notify::g-name-owner", schedule_sync)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGHUP, schedule_sync)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, lambda: (loop.quit(), GLib.SOURCE_REMOVE)[1])
+
+    sync()
+    loop.run()
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--config", default="/etc/battery-optimizer/hook.conf")
+    ap.add_argument("--state-dir", default=os.environ.get("STATE_DIRECTORY", "/var/lib/battery-optimizer"))
+    ap.add_argument("--sysfs", default="/sys")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--restore", action="store_true",
+                      help="undo all Power Saver extras and exit (used by uninstall)")
+    mode.add_argument("--profile", choices=sorted(TLP_PROFILES.values()),
+                      help="apply PROFILE once and exit (testing/manual use)")
+    ap.add_argument("--no-dbus", action="store_true", help="skip Docker handling (testing)")
+    args = ap.parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    try:
+        conf = parse_config(args.config)
+    except (OSError, ConfigError) as e:
+        log.error("config error: %s", e)
+        return 2
+    os.makedirs(args.state_dir, mode=0o700, exist_ok=True)
+
+    if args.restore or args.profile:
+        systemd = None
+        if not args.no_dbus:
+            from gi.repository import Gio, GLib
+            systemd = make_systemd_caller(Gio, GLib, Gio.bus_get_sync(Gio.BusType.SYSTEM, None))
+        hook = Hook(conf, args.state_dir, args.sysfs, systemd)
+        if args.restore:
+            hook.restore()
+        else:
+            hook.apply(args.profile)
+        return 0
+    return run_daemon(conf, args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

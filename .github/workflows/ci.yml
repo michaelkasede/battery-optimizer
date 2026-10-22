@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update -q && sudo apt-get install -y -q shellcheck bats python3
+      - name: shellcheck
+        run: shellcheck battery-optimizer tests/stubs/stub
+      - name: Python syntax
+        run: python3 -c "import ast; ast.parse(open('hook/profile-hook').read())"
+      - name: bats
+        run: bats tests/

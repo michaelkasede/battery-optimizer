@@ -1,0 +1,4 @@
+# Installed by battery-optimizer @VERSION@ — removed by: battery-optimizer uninstall
+# AC plug/unplug: ask the profile hook to re-sync (replaces v1.1 .path units,
+# which never fired because sysfs attributes do not emit inotify events).
+SUBSYSTEM=="power_supply", ACTION=="change", ATTR{type}=="Mains|USB", RUN+="/usr/bin/systemctl --no-block try-reload-or-restart @HOOK_UNIT_NAME@"
