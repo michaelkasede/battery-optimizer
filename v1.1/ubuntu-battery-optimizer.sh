@@ -290,8 +290,6 @@ cat > /etc/modprobe.d/i915-power.conf << EOF
 # Intel Iris Xe - Profile: ${PROFILE_NAME}
 options i915 enable_psr=${I915_ENABLE_PSR}
 options i915 enable_fbc=${I915_ENABLE_FBC}
-options i915 enable_rc6=7
-options i915 lvds_downclock=1
 EOF
 
 echo -e "  ${GREEN}✓${NC} Iris Xe: PSR=${I915_ENABLE_PSR}, FBC=${I915_ENABLE_FBC}"
@@ -341,12 +339,8 @@ systemctl disable powertop.service 2>/dev/null
 systemctl stop powertop.service 2>/dev/null
 rm -f /etc/systemd/system/powertop.service
 
-if command -v powertop &>/dev/null; then
-  powertop --auto-tune 2>/dev/null
-  echo -e "  ${GREEN}✓${NC} PowerTOP tuned once (TLP remains primary configurator)"
-else
-  echo -e "  ${YELLOW}⚠${NC} PowerTOP not available"
-fi
+# powertop --auto-tune removed: it overrides TLP's USB/NVIDIA denylists
+echo -e "  ${GREEN}✓${NC} PowerTOP auto-tune skipped (TLP is the only configurator)"
 
 # ============================================================
 # STEP 8 — Thermald
@@ -530,12 +524,6 @@ NEW_PARAMS=(
   "quiet" "splash"
   "nmi_watchdog=0"
   "mem_sleep_default=deep"
-  "i915.enable_psr=${I915_ENABLE_PSR}"
-  "i915.enable_fbc=${I915_ENABLE_FBC}"
-  "i915.enable_rc6=7"
-  "nvme_core.default_ps_max_latency_us=5500"
-  "intel_idle.max_cstate=9"
-  "usbcore.autosuspend=5"
 )
 
 if [[ "$GRUB_PCIE_ASPM" == "force" ]]; then
