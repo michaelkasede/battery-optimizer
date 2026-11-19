@@ -79,6 +79,41 @@ battery_watts() {
 # record_unit UNIT — remember the unit's original enablement state
 record_unit() { manifest_set_once svc "$1" "$(unit_enabled_state "$1")"; }
 
+# Charge thresholds live in the embedded controller and survive removing TLP,
+# so uninstall has to put them back itself.
+record_charge_thresholds() {
+  local d s e
+  for d in "$SYS"/class/power_supply/*; do
+    [[ -e "$d/charge_control_end_threshold" ]] || continue
+    s=$(read_sys "$d/charge_control_start_threshold"); e=$(read_sys "$d/charge_control_end_threshold")
+    [[ "$e" =~ ^[0-9]+$ ]] || continue
+    (( DRY_RUN )) || manifest_set_once charge "${d##*/}" "${s:--}:$e"
+  done
+}
+
+restore_charge_thresholds() {
+  local d bat val s e cur_e
+  for d in "$SYS"/class/power_supply/*; do
+    [[ -e "$d/charge_control_end_threshold" ]] || continue
+    bat=${d##*/}
+    # not recorded by installs before 1.2.0: fall back to the firmware default
+    val=$(manifest_get charge "$bat") || val="0:100"
+    s=${val%%:*}; e=${val#*:}
+    [[ "$s" =~ ^[0-9]+$ && -e "$d/charge_control_start_threshold" ]] || s=""
+    cur_e=$(read_sys "$d/charge_control_end_threshold")
+    # the start threshold must stay below the end threshold at every step
+    if [[ -n "$s" && "$cur_e" =~ ^[0-9]+$ ]] && (( s < cur_e )); then
+      runcmd_ok write_sys "$d/charge_control_start_threshold" "$s"
+      runcmd_ok write_sys "$d/charge_control_end_threshold" "$e"
+    else
+      runcmd_ok write_sys "$d/charge_control_end_threshold" "$e"
+      [[ -n "$s" ]] && runcmd_ok write_sys "$d/charge_control_start_threshold" "$s"
+    fi
+    info "$bat: charge thresholds ${s:-?}-$e %"
+  done
+  return 0
+}
+
 step_packages() {
   local pkgs=(tlp tlp-rdw tlp-pd python3-gi) remove=() p ver tlp_was_installed=0
   [[ "$CPU_VENDOR" == intel ]] && pkgs+=(thermald)
@@ -377,6 +412,10 @@ uninstall_all() {
       runcmd_ok add-apt-repository -y --remove "ppa:$TLP_PPA"
     fi
   fi
+
+  # after TLP is gone, so nothing re-applies our thresholds
+  section "Battery"
+  restore_charge_thresholds
 
   prev=$(manifest_get prime - 2>/dev/null || true)
   if [[ -n "$prev" && "$prev" != unknown ]] && have prime-select \

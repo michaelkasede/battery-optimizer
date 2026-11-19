@@ -132,6 +132,28 @@ setup() {
   [ "$status" -eq 0 ]
 }
 
+@test "charge thresholds are restored on uninstall" {
+  t="$BO_SYSFS/class/power_supply/BAT0"
+  echo 75 > "$t/charge_control_start_threshold"; echo 90 > "$t/charge_control_end_threshold"
+  "$CLI" install --yes >/dev/null
+  grep -qP '^charge\tBAT0\t75:90$' "$BO_ROOT/etc/battery-optimizer/manifest"
+  # what TLP would write at boot
+  echo 40 > "$t/charge_control_start_threshold"; echo 50 > "$t/charge_control_end_threshold"
+  "$CLI" uninstall --yes >/dev/null
+  [ "$(cat "$t/charge_control_start_threshold")" = 75 ]
+  [ "$(cat "$t/charge_control_end_threshold")" = 90 ]
+}
+
+@test "unrecorded charge thresholds fall back to the firmware default" {
+  "$CLI" install --yes >/dev/null
+  sed -i '/^charge\t/d' "$BO_ROOT/etc/battery-optimizer/manifest"
+  t="$BO_SYSFS/class/power_supply/BAT0"
+  echo 40 > "$t/charge_control_start_threshold"; echo 80 > "$t/charge_control_end_threshold"
+  "$CLI" uninstall --yes >/dev/null
+  [ "$(cat "$t/charge_control_start_threshold")" = 0 ]
+  [ "$(cat "$t/charge_control_end_threshold")" = 100 ]
+}
+
 @test "previous prime-select mode is restored on uninstall" {
   echo nvidia > "$BO_ROOT/var/lib/stub/prime"
   "$CLI" install --yes >/dev/null

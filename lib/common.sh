@@ -84,6 +84,9 @@ read_sys() {
   printf '%s' "$line"
 }
 
+# write_sys FILE VALUE — write a sysfs attribute (use through runcmd/runcmd_ok)
+write_sys() { printf '%s\n' "$2" > "$1"; }
+
 sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
 
 is_root() { [[ $EUID -eq 0 ]]; }

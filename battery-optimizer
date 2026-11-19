@@ -147,6 +147,7 @@ cmd_install() {
   manifest_load
   BOOT_CHANGED=0
   trap install_exit_trap EXIT
+  record_charge_thresholds
 
   section "v1.x leftovers"
   migrate_detect
@@ -257,7 +258,7 @@ cmd_status() {
     if [[ "$DGPU_VENDOR" == nvidia ]]; then
       have prime-select && info "prime-select:    $(prime-select query 2>/dev/null || echo unknown)"
       info "persistenced:    $(unit_enabled_state nvidia-persistenced.service) / $(unit_active_state nvidia-persistenced.service)"
-      rtd3=$(sed -n 's/^Runtime D3 status: *//p' "$PROC/driver/nvidia/gpus/$DGPU_PCI/power" 2>/dev/null)
+      rtd3=$(sed -n 's/^Runtime D3 status: *//p' "$PROC/driver/nvidia/gpus/$DGPU_PCI/power" 2>/dev/null || true)
       info "Runtime D3:      ${rtd3:-unknown}"
       [[ "$rtd3" == "Not supported"* ]] && warn "the driver will never power the dGPU off (RTD3 not supported) — see README troubleshooting"
       if [[ "$(read_sys "$SYS/bus/pci/devices/$DGPU_PCI/power/runtime_status")" == active ]]; then

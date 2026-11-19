@@ -9,6 +9,7 @@
 #   pkg-del   PACKAGE  -   (removed by us or by apt conflicts)
 #   ppa       NAME     -   (apt source added by us)
 #   prime     -        prime-select mode before install
+#   charge    BATTERY  START:END charge thresholds before install (START is - if absent)
 #
 # In dry-run mode the manifest lives in memory only.
 

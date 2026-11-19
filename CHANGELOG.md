@@ -61,6 +61,10 @@ and `tlp-pd`. Nothing needs a reboot per switch.
   plus `After=tlp-pd.service` formed an ordering cycle (`tlp-pd` is
   `After=multi-user.target`). It now installs into `graphical.target`, and
   `install` uses `systemctl reenable` to drop the old link.
+- `uninstall` restores the battery charge thresholds recorded at install (the
+  firmware default 0-100 % when none were recorded). They live in the embedded
+  controller, so removing TLP left the battery stuck at 40-80 %.
+- `status` no longer exits when `/proc/driver/nvidia/gpus/*/power` is missing.
 - `measure` skips 0 W samples (EC lag right after unplugging) instead of
   averaging them in.
 - `status` shows the NVIDIA "Runtime D3 status" and warns when it is

@@ -134,7 +134,7 @@ Only these files are written, each recorded with a checksum in `/etc/battery-opt
 | `/etc/modprobe.d/50-battery-optimizer-nvidia.conf` | NVIDIA only |
 | `/usr/local/sbin/battery-optimizer`, `/usr/local/lib/battery-optimizer/` | The tool itself |
 
-`uninstall` removes them, puts back `power-profiles-daemon` (and `tuned`, if it was in use), restores the unit states and `prime-select` mode, and removes the PPA. Locally edited files are backed up before removal.
+`uninstall` removes them, puts back `power-profiles-daemon` (and `tuned`, if it was in use), restores the unit states, `prime-select` mode and battery charge thresholds, and removes the PPA. Thresholds are kept by the ThinkPad's embedded controller, not by TLP, so they would otherwise stay at 40–80 % after uninstalling; installs from before this fix did not record the originals, and uninstall then resets them to the firmware default (0–100 %). Locally edited files are backed up before removal.
 
 ## Coming from v1.1
 
