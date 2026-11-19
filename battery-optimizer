@@ -233,7 +233,7 @@ cmd_uninstall() {
 # ---------------------------------------------------------------- status
 
 cmd_status() {
-  local f sum state cmdline profile w
+  local f sum state cmdline profile w rtd3
   printf '%sbattery-optimizer %s — status%s\n' "$C_BLD" "$BO_VERSION" "$C_OFF"
 
   section "Hardware"
@@ -257,6 +257,9 @@ cmd_status() {
     if [[ "$DGPU_VENDOR" == nvidia ]]; then
       have prime-select && info "prime-select:    $(prime-select query 2>/dev/null || echo unknown)"
       info "persistenced:    $(unit_enabled_state nvidia-persistenced.service) / $(unit_active_state nvidia-persistenced.service)"
+      rtd3=$(sed -n 's/^Runtime D3 status: *//p' "$PROC/driver/nvidia/gpus/$DGPU_PCI/power" 2>/dev/null)
+      info "Runtime D3:      ${rtd3:-unknown}"
+      [[ "$rtd3" == "Not supported"* ]] && warn "the driver will never power the dGPU off (RTD3 not supported) — see README troubleshooting"
       if [[ "$(read_sys "$SYS/bus/pci/devices/$DGPU_PCI/power/runtime_status")" == active ]]; then
         info "dGPU is awake. See what holds it: nvidia-smi; sudo fuser -v /dev/nvidia*"
       fi

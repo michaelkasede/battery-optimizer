@@ -17,7 +17,7 @@ setup() {
   [ "$(tree_snapshot "$BO_ROOT")" = "$before" ]
   [[ "$output" == *"[dry-run] apt-get install"* ]]
   [[ "$output" == *"STOP_CHARGE_THRESH_BAT0=80"* ]]
-  ! grep -qE '^(apt-get install|systemctl (enable|mask|disable)|update-grub|prime-select on)' "$BO_TEST_LOG"
+  ! grep -qE '^(apt-get install|systemctl (enable|reenable|mask|disable)|update-grub|prime-select on)' "$BO_TEST_LOG"
 }
 
 @test "install writes drop-ins, records a manifest and replaces power-profiles-daemon" {

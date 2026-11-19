@@ -287,9 +287,11 @@ step_services() {
   runcmd_ok systemctl daemon-reload
   runcmd_ok udevadm control --reload-rules
   # our own units: removed with their package/file on uninstall
-  for u in tlp.service tlp-pd.service "$HOOK_UNIT_NAME"; do
+  for u in tlp.service tlp-pd.service; do
     runcmd_ok systemctl enable "$u"
   done
+  # reenable drops the v1.2.0 multi-user.target.wants link (ordering cycle)
+  runcmd_ok systemctl reenable "$HOOK_UNIT_NAME"
   runcmd_ok systemctl restart tlp-pd.service
   runcmd_ok systemctl restart "$HOOK_UNIT_NAME"
   runcmd_ok tlp start
@@ -402,7 +404,7 @@ uninstall_all() {
 # ---------------------------------------------------------------- measure
 
 measure_draw() {
-  local minutes="$1" interval="$2" samples i bat w sum status total=0 n=0 min="" max="" profile
+  local minutes="$1" interval="$2" samples i bat w sum status total=0 n=0 skipped=0 min="" max="" profile
   samples=$(( minutes * 60 / interval ))
   (( samples > 0 )) || samples=1
 
@@ -421,16 +423,25 @@ measure_draw() {
       [[ "$status" == Discharging ]] || die "charger connected during measurement — aborted"
       w=$(battery_watts "$SYS/class/power_supply/$bat")
       [[ -n "$w" ]] || die "$bat reports no power_now/current_now"
+      # the EC reports 0 W for a few seconds after unplugging
+      [[ "$w" == 0.00 ]] && { sum=""; break; }
       sum=$(awk -v a="$sum" -v b="$w" 'BEGIN { printf "%.2f", a + b }')
     done
+    if [[ -z "$sum" ]]; then
+      skipped=$((skipped + 1))
+      (( i < samples )) && sleep "$interval"
+      continue
+    fi
     total=$(awk -v a="$total" -v b="$sum" 'BEGIN { printf "%.4f", a + b }')
-    n=$i
+    n=$((n + 1))
     if [[ -z "$min" ]] || awk -v a="$sum" -v b="$min" 'BEGIN { exit !(a < b) }'; then min=$sum; fi
     if [[ -z "$max" ]] || awk -v a="$sum" -v b="$max" 'BEGIN { exit !(a > b) }'; then max=$sum; fi
     if [[ -t 1 ]]; then printf '\r  sample %d/%d: %s W   ' "$i" "$samples" "$sum"; fi
     (( i < samples )) && sleep "$interval"
   done
   [[ -t 1 ]] && printf '\n'
+  (( n > 0 )) || die "every sample read 0 W — the battery is not reporting its draw"
+  (( skipped == 0 )) || info "Skipped $skipped sample(s) that read 0 W (EC not yet updated)"
 
   local mean energy_full=0 energy_now=0 e
   mean=$(awk -v t="$total" -v n="$n" 'BEGIN { printf "%.2f", t / n }')

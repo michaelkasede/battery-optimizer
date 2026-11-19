@@ -35,4 +35,6 @@ LockPersonality=yes
 SystemCallArchitectures=native
 
 [Install]
-WantedBy=multi-user.target
+# Not multi-user.target: tlp-pd.service is After=multi-user.target, so that
+# would form an ordering cycle and systemd drops this unit at boot.
+WantedBy=graphical.target

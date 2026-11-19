@@ -71,7 +71,7 @@ case "$cmd" in
     case "$verb" in
       is-enabled) s=$(unit_get "$unit"); [[ -n "$s" ]] || exit 1; echo "$s"; [[ "$s" == enabled ]] ;;
       is-active) echo inactive; exit 3 ;;
-      enable)  [[ -n "$(unit_get "$unit")" || "$unit" == battery-optimizer-hook.service ]] && unit_set "$unit" enabled; exit 0 ;;
+      enable|reenable)  [[ -n "$(unit_get "$unit")" || "$unit" == battery-optimizer-hook.service ]] && unit_set "$unit" enabled; exit 0 ;;
       disable) [[ -n "$(unit_get "$unit")" ]] && unit_set "$unit" disabled; exit 0 ;;
       daemon-reload)
         # units whose file was deleted disappear (only our hook lives in /etc)

@@ -51,6 +51,21 @@ and `tlp-pd`. Nothing needs a reboot per switch.
 - Gaming and Endurance profiles (see `docs/GAMING.md`).
 - `vm.laptop_mode` sysctl (removed from the kernel in 7.0).
 
+### Documented
+- NVIDIA drivers (open and proprietary, any Ubuntu branch) and Lenovo firmware
+  (fwupd/LVFS) are always supported as shipped: goal G7 and PRD §5.7, README
+  "Driver and firmware updates".
+
+### Fixed (found on the reference machine)
+- The profile hook never started after a reboot: `WantedBy=multi-user.target`
+  plus `After=tlp-pd.service` formed an ordering cycle (`tlp-pd` is
+  `After=multi-user.target`). It now installs into `graphical.target`, and
+  `install` uses `systemctl reenable` to drop the old link.
+- `measure` skips 0 W samples (EC lag right after unplugging) instead of
+  averaging them in.
+- `status` shows the NVIDIA "Runtime D3 status" and warns when it is
+  "Not supported".
+
 ## [1.1.0]
 
 Four selectable profiles (Performance, Balanced, Endurance, Gaming); switch by

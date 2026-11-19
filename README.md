@@ -16,6 +16,7 @@ The project gets those laptops into a well-configured, low-power state and then 
 - **Battery longevity.** Charge thresholds (40 → 80 % by default) reduce wear on the cells.
 - **A modest runtime gain.** Expect **up to about 1 extra hour at best**. On the P14s Gen 3 that's roughly **4 h → 5 h** of light use (browser, editor, terminal). Most of the large savings come from correct configuration of stock components, not from aggressive tweaks.
 - **Stability first.** No forced or obsolete kernel and driver options. Everything can be undone.
+- **Update-friendly.** NVIDIA drivers and Lenovo firmware are always supported as shipped. Update them the normal way (Software Updater, `fwupdmgr`) with no manual re-tuning. See [Driver and firmware updates](#6-driver-and-firmware-updates).
 
 ## Quick start
 
@@ -84,7 +85,7 @@ All values live in [`config/profiles.conf`](config/profiles.conf). Edit them the
 
 ### 3. One-time, install-only settings
 
-- **Discrete GPU off when idle.** NVIDIA uses the proprietary driver with `NVreg_DynamicPowerManagement=0x02` (Turing and newer), `prime-select on-demand` and nouveau blacklisted. Video memory is preserved across suspend in `/var/tmp`. AMD needs no options, since amdgpu runtime PM is on by default.
+- **Discrete GPU off when idle.** NVIDIA uses Ubuntu's packaged driver (open or proprietary kernel module, any branch) with `NVreg_DynamicPowerManagement=0x02` (Turing and newer), `prime-select on-demand` and nouveau blacklisted. Video memory is preserved across suspend in `/var/tmp`. AMD needs no options, since amdgpu runtime PM is on by default.
 - **Charge thresholds** on every battery that exposes them. Batteries that only support a stop threshold get only that.
 - **No kernel parameters.** TLP sets `NMI_WATCHDOG=0` and the suspend mode (`deep` only where `/sys/power/mem_sleep` offers it) at runtime. `/etc/default/grub` is not edited, except to remove v1.x parameters during migration.
 - **One power manager.** `power-profiles-daemon` is replaced and `tuned` is disabled. `thermald` is enabled on Intel CPUs.
@@ -104,7 +105,23 @@ See [docs/GAMING.md](docs/GAMING.md).
 
 The installer reads sysfs for the iGPU and dGPU (vendor, driver, PCI address, whether the dGPU has outputs), batteries and their charge thresholds, the internal panel's backlight, platform-profile choices, suspend modes and USB HID receivers (added to `USB_DENYLIST`). Unsupported setups are refused unless you pass `--force`.
 
-### 6. Reversible by design
+### 6. Driver and firmware updates
+
+The project configures what NVIDIA and Lenovo ship and never replaces or works around it ([PRD §5.7](PRD.md#57-vendor-driver-and-firmware-compatibility)):
+
+- **NVIDIA driver.** Both `nvidia-driver-NNN-open` and `nvidia-driver-NNN` are supported, on any branch Ubuntu offers. No version pins, holds or patches, and only module options documented for every branch are written. Upgrading the branch or switching flavour needs only the usual reboot. *(Planned: stop repeating options the driver package already sets.)*
+- **Lenovo firmware.** Only the standard kernel interfaces are used (`platform_profile`, charge thresholds, ACPI power management). No `acpi_call`, EC writes or ACPI overrides. `fwupd` is never touched, so BIOS and EC updates keep coming through `fwupdmgr` / Software Updater.
+- **After any update,** run `battery-optimizer status`. It re-detects the hardware and reports the driver's own runtime-D3 state. Platform-profile choices, suspend modes and charge thresholds are written into the TLP drop-in at install, so if a firmware update changes them, re-run `sudo battery-optimizer install` (it is idempotent). Otherwise re-run it only when this project itself is updated.
+
+```bash
+sudo fwupdmgr refresh && sudo fwupdmgr update   # Lenovo BIOS/EC
+sudo apt update && sudo apt full-upgrade        # NVIDIA driver, kernel
+sudo reboot
+# after the reboot:
+sudo battery-optimizer status
+```
+
+### 7. Reversible by design
 
 Only these files are written, each recorded with a checksum in `/etc/battery-optimizer/manifest`:
 
@@ -140,7 +157,21 @@ Follow [PRD.md §9](PRD.md#9-measurement-protocol): unplug, set brightness to 40
 battery-optimizer measure 10
 ```
 
-It prints the mean draw in watts and the runtime at that draw.
+It prints the mean draw in watts and the runtime at that draw. Samples that read 0 W (the EC lags for a few seconds after unplugging) are skipped.
+
+## Troubleshooting
+
+**`battery-optimizer-hook.service` is `inactive` after a reboot.** v1.2.0 installed it into `multi-user.target`, which forms an ordering cycle with `tlp-pd.service` (`After=multi-user.target`); systemd drops the hook at boot (`journalctl -b | grep 'ordering cycle'`). Re-run `sudo battery-optimizer install`, which re-enables it under `graphical.target`.
+
+**`status` shows `Runtime D3: Not supported`.** The NVIDIA driver will never power the dGPU off, so it idles in P8 at about 4 W regardless of what holds `/dev/nvidia*`. The project does not force RTD3 on; the fix has to be a supported driver and firmware setup. Check, one at a time and with a reboot each:
+
+1. Firmware: install pending Lenovo updates (`fwupdmgr get-updates`), and if the BIOS has a graphics-device setting, use *Hybrid*, not *Discrete*.
+2. Driver flavour: both flavours are supported, but Turing GPUs (like the T550) can differ between them. Try the other one through Ubuntu: `ubuntu-drivers list` shows both, e.g. `sudo apt install nvidia-driver-NNN` replaces `nvidia-driver-NNN-open` (same NNN), or the reverse. No re-install of this project is needed.
+3. Boot parameters left over from VFIO passthrough (`intel_iommu=on iommu=pt pcie_acs_override=… vfio_iommu_type1.allow_unsafe_interrupts=1 kvm.ignore_msrs=1`) — remove them from `/etc/default/grub` and `sudo update-grub` if you no longer pass the GPU to a VM.
+
+**`thermald.service` is `inactive`.** Expected on ThinkPads whose firmware manages thermals (DYTC): thermald logs "Thermald can't run on this platform" and exits.
+
+Once RTD3 is supported, `gnome-shell`/`Xwayland` holding `/dev/nvidia0` open is normal on Wayland; the GPU still suspends as long as nothing renders on it.
 
 ## Development
 

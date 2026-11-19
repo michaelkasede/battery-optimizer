@@ -27,6 +27,7 @@ The realistic benefit of this project is **battery longevity** and **up to ~1 ex
 | G4 | Stability | No forced/obsolete kernel or driver parameters by default; zero display flicker, Wi-Fi, NVMe or USB regressions attributable to the project |
 | G5 | Reversibility | `--uninstall` returns the machine to stock Ubuntu config; every file written is tracked in a manifest |
 | G6 | Portability | Works on Ubuntu 24.04.5 laptops with NVIDIA or AMD dGPUs via hardware detection; no hard-coded PCI addresses or USB IDs |
+| G7 | Vendor updates | The NVIDIA driver (any Ubuntu-packaged branch, open or proprietary kernel module) and the Lenovo firmware (BIOS, EC, via fwupd/LVFS) update through the normal Ubuntu channels. The optimizer keeps working afterwards with no re-install, re-tuning or other manual step (§5.7) |
 
 ### Non-goals
 
@@ -34,6 +35,7 @@ The realistic benefit of this project is **battery longevity** and **up to ~1 ex
 - Overclocking, undervolting, fan curves, or anything that can damage hardware.
 - Replacing the desktop's power UI with a custom GNOME Shell extension.
 - Guaranteeing a specific runtime — results depend on battery health, panel, and workload.
+- Pinning, holding, patching or building NVIDIA drivers; overriding ACPI tables, writing EC registers or flashing firmware. Updates come from Ubuntu and Lenovo, not from this project (§5.7).
 
 ## 3. Background — what we found in v1.1
 
@@ -142,7 +144,7 @@ TLP has no documented hook for profile changes, so v1.2 adds a small root servic
 |---|---|
 | **TLP** | Install TLP ≥ 1.9 with `tlp-pd` and `tlp-rdw` from `ppa:linrunner/tlp`; remove `power-profiles-daemon` and `tuned-ppd` (the Debian `tlp-pd` package `Conflicts:` with both); disable + mask `tuned` if present (it was enabled on the reference machine) |
 | **Charge thresholds** | `START_CHARGE_THRESH_BAT0` / `STOP_CHARGE_THRESH_BAT0` (default 40/80) in the TLP drop-in; skip with a notice where unsupported |
-| **NVIDIA dGPU** | Proprietary driver (verified, not auto-installed: `ubuntu-drivers install` may need Secure Boot MOK enrollment); `NVreg_DynamicPowerManagement=0x02` (Turing and newer, detected as PCI device ID ≥ 0x1e00); `prime-select on-demand` permanently; nouveau blacklisted; enable `nvidia-suspend/resume/hibernate` services when `PreserveVideoMemoryAllocations=1`; temp file path on disk (`/var/tmp`), not tmpfs |
+| **NVIDIA dGPU** | Ubuntu-packaged NVIDIA driver, open or proprietary kernel module, any supported branch (verified, not auto-installed: `ubuntu-drivers install` may need Secure Boot MOK enrollment; see §5.7); `NVreg_DynamicPowerManagement=0x02` (Turing and newer, detected as PCI device ID ≥ 0x1e00); `prime-select on-demand` permanently; nouveau blacklisted; enable `nvidia-suspend/resume/hibernate` services when `PreserveVideoMemoryAllocations=1`; temp file path on disk (`/var/tmp`), not tmpfs |
 | **AMD dGPU** | No driver options needed (runtime PM is default); verify `power/control=auto`; document `DRI_PRIME=1` |
 | **No GPU-mode switching** | Remove `prime-select intel/nvidia` from profiles — on-demand already powers the dGPU off when idle, and switching needs a logout/reboot |
 | **Gaming** | Not a menu mode. Document Steam launch options: NVIDIA `tlpctl launch -p performance prime-run %command%`; AMD `tlpctl launch -p performance env DRI_PRIME=1 %command%` |
@@ -161,6 +163,8 @@ Detect at install and on `--status`; never hard-code:
 - Platform profile support (`/sys/firmware/acpi/platform_profile_choices`).
 - USB HID receivers (Logitech Unifying/Bolt and similar) → `USB_DENYLIST`. Note: TLP already skips autosuspend for any USB device with a HID interface (`_hid_deny` in `func.d/20-tlp-func-usb`). The v1.1 receiver lag was most likely caused by `usbcore.autosuspend=5` / `powertop --auto-tune`, which bypass TLP. The explicit denylist is kept as a safeguard.
 - Suspend modes available.
+- NVIDIA kernel-module flavour (open/proprietary) and driver version from `/proc/driver/nvidia/version`; RTD3 support from `/proc/driver/nvidia/gpus/*/power` (§5.7).
+- BIOS vendor and version (`/sys/class/dmi/id/`), informational (§5.7).
 - Unsupported configurations (not Ubuntu 24.04.x, no dGPU, no battery) → refuse with a clear message unless `--force`.
 
 ### 5.5 CLI
@@ -184,6 +188,38 @@ Profile switching is done in the GNOME menu or `tlpctl`, not by this CLI.
 - `uninstall` removes manifest files, reinstalls `power-profiles-daemon`, optionally removes the TLP PPA, rebuilds initramfs/GRUB only if a boot-time file was removed.
 - `--dry-run` prints every action without changing anything.
 - Migration: `install` detects v1.1 artifacts (`/etc/modprobe.d/i915-power.conf`, `iwlwifi-power.conf`, `/etc/tlp.conf` written by v1.1, legacy GRUB params, `.path` units) and offers to remove them, folding in `restore-baseline.sh`.
+
+### 5.7 Vendor driver and firmware compatibility
+
+The project configures what NVIDIA and Lenovo ship; it never replaces or works around it. That way driver and firmware updates arrive through `apt`/Software Updater and `fwupd`, and the machine stays optimized without manual steps.
+
+**NVIDIA driver**
+
+| Requirement | Detail |
+|---|---|
+| Both kernel-module flavours | Support `nvidia-driver-NNN` and `nvidia-driver-NNN-open` equally. Detect the flavour from the loaded module (`/proc/driver/nvidia/version`), never from a package name, and report it in `status` |
+| Any supported branch | No version pins, `apt-mark hold`, DKMS patches or branch-specific code paths. A branch upgrade (e.g. 595 → 610) or flavour swap needs no re-install |
+| Branch-agnostic options only | Write only module options documented in the driver README for all current branches (`NVreg_DynamicPowerManagement`, `NVreg_PreserveVideoMemoryAllocations`, `NVreg_TemporaryFilePath`). Never write undocumented or tuning `NVreg_*` options |
+| Defer to the packaged defaults | The Ubuntu driver packages already ship `nvidia-runtimepm.conf`, `nvidia-kms.conf` and `nvidia-graphics-drivers-kms.conf`. Only add what they leave unset, and never contradict them, so a package update cannot leave two conflicting values |
+| Use the packaged services | Enable `nvidia-suspend/resume/hibernate.service` from the driver package; do not ship replacements |
+| Verify, don't assume | After install and in `status`, read the driver's own report (`/proc/driver/nvidia/gpus/*/power`: "Runtime D3 status", "Video Memory") rather than inferring from config. When the driver reports RTD3 "Not supported", say so and point to the cause, without forcing it on |
+
+**Lenovo firmware**
+
+| Requirement | Detail |
+|---|---|
+| Standard kernel interfaces only | Use what the firmware exposes through upstream drivers: `platform_profile` (thinkpad_acpi DYTC), `charge_control_{start,end}_threshold`, ACPI power resources for PCIe runtime D3. No `acpi_call`, EC register writes, DSDT/SSDT overrides or `acpi_osi=` parameters |
+| Firmware decides | Settings are policies within what the firmware allows (e.g. `PCIE_ASPM_ON_BAT=powersupersave`, not `pcie_aspm=force`; `MEM_SLEEP=deep` only if listed). Platform-profile choices, suspend modes and charge-threshold support are rendered into the drop-in at install, so after a BIOS update that changes them `status` must flag the drift and point to re-running `install`; no hand-editing of config |
+| fwupd untouched | Never disable, mask or remove `fwupd` / `fwupd-refresh.timer`. `status` shows the BIOS version (`/sys/class/dmi/id/bios_version`) and suggests `fwupdmgr get-updates` |
+| thermald on DYTC platforms | On ThinkPads with `dytc_lapmode`, thermald exits by design and the firmware manages thermals. `status` reports this as expected, not as a failure |
+
+**Implementation status (2026-10-31).** Not yet met: the modprobe drop-in repeats package defaults (§12 note 11c); `status` does not yet show the driver flavour, BIOS version, fwupd hint or capability drift; `install` still enables thermald on DYTC platforms. Met: no pins/holds/patches, no ACPI/EC access, fwupd untouched, RTD3 status read from the driver.
+
+**After an update**
+
+- Driver, kernel and firmware updates need at most the reboot they already require. Nothing in this project has to be re-run.
+- `battery-optimizer status` re-detects everything and flags anything the update changed (flavour, RTD3 support, platform-profile choices, charge-threshold support).
+- Re-running `install` stays idempotent. It is needed when *this project* is updated, or when `status` reports a firmware capability change.
 
 ## 6. Security requirements
 
@@ -239,6 +275,7 @@ Migration steps:
 - **Unit (bats):** renderers produce the expected TLP/GRUB/modprobe files from fixtures; v1.1 migration removes exactly the listed parameters (fixture: the reference machine's current cmdline); manifest/uninstall round-trip leaves fixtures identical.
 - **Detection fixtures:** captured `lspci`, `lsusb`, sysfs trees for the P14s Gen 3 plus at least one AMD-dGPU and one NVIDIA-with-outputs laptop.
 - **Manual matrix (reference machine):** install → reboot → switch each GNOME mode → verify with `tlp-stat -s -p`, `tlpctl`, `cat /proc/cmdline`; AC plug/unplug triggers hook; external HDMI and USB-C monitors stable for ≥ 1 h; suspend/resume with dGPU idle; Steam game with `prime-run`; uninstall → reboot → stock behaviour restored.
+- **Vendor-update matrix (§5.7):** swap `nvidia-driver-NNN-open` ↔ `nvidia-driver-NNN` and upgrade to the next driver branch, each followed by a reboot only; apply a Lenovo BIOS/EC update from `fwupdmgr`. After each, `status` must show the hook active, RTD3 status read from the driver, charge thresholds and platform profile applied, and no manual step taken.
 
 ## 9. Measurement protocol
 
@@ -268,6 +305,7 @@ Used for the §4 gate and to substantiate the runtime claim.
 | 4 | README BIOS checklist | Dropped from docs until verified on the P14s Gen 3 BIOS. No step depends on it |
 | 5 | `mem_sleep_default=deep` | Not a kernel parameter any more. TLP `MEM_SLEEP_*=deep` only where the firmware lists `deep` |
 | 6 | VFIO/IOMMU parameters | Left to the user. `status` warns (allow_unsafe_interrupts, pcie_acs_override, kvm.ignore_msrs, iommu=pt, intel_iommu=on). No opt-in cleanup in v1.2 |
+| 7 | NVIDIA driver and Lenovo firmware | Always supported as shipped, through Ubuntu and LVFS updates; the project only configures them (§5.7, G7) |
 
 ## 12. Implementation notes and refinements (v1.2.0)
 
@@ -283,3 +321,5 @@ Findings while implementing that change or sharpen the requirements above:
 8. **Reference machine observations (2026-10-22).** v1.1 leftovers are still active (forced FBC/PSR, `pcie_aspm=force` and the rest of §3.1 in `/proc/cmdline`). `power-profiles-daemon` and `tuned` are both enabled while TLP is not installed. The T550 showed `runtime_status=active` on battery at ~18 W. `status` now reports the dGPU wake state and `nvidia-persistenced`, so this can be checked again after migration and a reboot.
 9. **Versioning (§7).** Tags `v1.0.0` (commit 73ebd71, the original root-level script) and `v1.1.0` (v1.1 + interim fixes) exist. The version folders were removed on `feature/tlp-pd`.
 10. **Verification done without root.** shellcheck clean. 57 bats tests cover the parser, detection on three fixture laptops, golden renders, migration, the install/idempotence/uninstall round-trip, and the hook logic. The hook was also tested live over D-Bus against the reference machine's `org.freedesktop.UPower.PowerProfiles` API (the one `tlp-pd` implements), including a real profile switch. `systemd-analyze verify` and `udevadm verify` pass for the generated unit and rules. **Still to do on hardware:** the §8 manual matrix and the §9 measurements.
+11. **Reference machine after v1.2 install and reboot (2026-10-22).** (a) The hook was dropped at boot by an ordering cycle (`WantedBy=multi-user.target` + `After=tlp-pd.service`, and `tlp-pd` is `After=multi-user.target`); fixed by `WantedBy=graphical.target`. (b) With `nvidia-driver-595-open` 595.91.07 the driver reports **Runtime D3 status: Not supported**, so the T550 idles in P8 at ~4 W of a ~10 W total, although `DynamicPowerManagement=2`, `power/control=auto` and the root port's `_PR3` power resources are all present. Cause not yet isolated; candidates are the kernel-module flavour, the BIOS graphics mode and the VFIO boot parameters. Per §5.7 the fix must come from a supported driver/firmware configuration, not a workaround. (c) Our modprobe drop-in repeats `NVreg_PreserveVideoMemoryAllocations` and `NVreg_DynamicPowerManagement` already set by the driver packages, and sets `NVreg_TemporaryFilePath=/var/tmp` while the package sets `/var` (by modprobe file order the package's value most likely wins; not verified in `/proc/driver/nvidia/params`). To bring in line with §5.7 "Defer to the packaged defaults". (d) thermald exits on this platform (`dytc_lapmode`), as expected.
+12. **Reference machine, 2026-10-31.** The optimizer had been uninstalled (stock `power-profiles-daemon`, no TLP) and the driver updated to `nvidia-driver-595-open` 595.99.02 on kernel 7.0.0-42. RTD3 is still **Not supported**, so note 11(b) is not caused by this project's configuration. The hook fix (note 11a) is confirmed: after the 2026-10-22 re-install the hook started on every boot, across the kernel update from 7.0.0-38 to 7.0.0-42, with no ordering-cycle messages.
